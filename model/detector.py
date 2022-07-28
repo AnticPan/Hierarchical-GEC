@@ -35,24 +35,25 @@ class Detector(nn.Module):
                                    zip(predict_labels, masks)]
         return list_predict_labels
 
-    def forward(self, encoder_output: torch.Tensor, masks: torch.Tensor,
-                target_labels: torch.Tensor = None):
+    def forward(self, words_states_no_cls: torch.Tensor, mask: torch.Tensor, target_labels: torch.Tensor = None):
         if self.use_lstm:
             self.lstm_layer.flatten_parameters()
-            lengths = torch.sum(masks, dim=-1)
-            encoder_output = pack_padded_sequence(encoder_output, lengths,
+            lengths = torch.sum(mask, dim=-1)
+            words_states_no_cls = pack_padded_sequence(words_states_no_cls, lengths,
                                                   batch_first=True, enforce_sorted=False)
-            encoder_output, _ = self.lstm_layer(encoder_output)
-            encoder_output, _ = pad_packed_sequence(encoder_output, batch_first=True, total_length=masks.size()[-1])
-            encoder_output = self.merge_layer(encoder_output)
-        labeling_output = self.detect_layer(encoder_output)
+            words_states_no_cls, _ = self.lstm_layer(words_states_no_cls)
+            words_states_no_cls, _ = pad_packed_sequence(words_states_no_cls, batch_first=True, total_length=mask.size()[-1])
+            words_states_no_cls = self.merge_layer(words_states_no_cls)
+        labeling_output = self.detect_layer(words_states_no_cls)
         loss = None
-        if isinstance(target_labels, torch.Tensor):
+        if target_labels is not None:
+            #target_labels = target_labels
             if self.use_crf:
+                
                 loss = -1 * \
-                    self.crf_layer(labeling_output, torch.where(target_labels==-100, torch.zeros(1, dtype=torch.long).cuda(), target_labels),
-                                   masks.bool(), reduction='none')
+                    self.crf_layer(labeling_output, torch.where(target_labels==-100, torch.zeros(1, dtype=torch.long, device=target_labels.device), target_labels),
+                                   mask, reduction='none')
             else:
                 loss = self.criterion(labeling_output.view(-1, labeling_output.size(-1)), target_labels.reshape(-1)).view(target_labels.size())
-                loss = loss.sum(-1)/masks.sum(-1)
+                loss = loss.sum(-1)/mask.sum(-1)
         return labeling_output, loss

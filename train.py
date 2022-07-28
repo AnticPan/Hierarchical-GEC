@@ -1,87 +1,102 @@
+import pickle
 import os
 import logging
-from data_loader import Dataset
-from model.patcher import Patcher
+from dataset import GECDataset
+from model.patcher import Patcher, PatcherOutput
 import argparse
 import torch
 import math
 import random
-from transformers import BertModel, AdamW
+from transformers import AdamW, AutoTokenizer
 from transformers.optimization import get_constant_schedule_with_warmup
-from utils.tokenizer import Tokenizer
-from utils.recoder import Statistic
-from utils.patch_handler import Patch_handler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-import logging
-logging.getLogger("train.py").setLevel(logging.INFO)
+from utils import Batch, EpochState, set_logger
 
 
-def handle_a_batch(step, model, batch, recoder, args):
-    discriminator_loss, detector_loss, decoder_loss = None, None, None
-    data = {"input_ids": batch.input_ids, "masks": batch.attention_mask, "token_type_ids": batch.token_type_ids}
-    encoder_outputs = model("encode", data)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
+
+def handle_a_batch(model: Patcher, batch: Batch, epoch_state: EpochState):
+    output: PatcherOutput
+    output = model(input_ids=batch.input_ids.cuda(),
+                   attention_mask=batch.attention_mask.cuda(),
+                   word_offsets=batch.word_offsets.cuda(),
+                   tf_labels=batch.tf_labels.cuda() if batch.tf_labels is not None else None,
+                   bio_tags=batch.bio_tags.cuda() if batch.bio_tags is not None else None,
+                   patch_idx=batch.patch_idx.cuda() if batch.patch_idx is not None else None,
+                   patch_start_pos=batch.patch_start_pos.cuda() if batch.patch_start_pos is not None else None,
+                   patch_mid_pos=batch.patch_mid_pos.cuda() if batch.patch_mid_pos is not None else None,
+                   patch_end_pos=batch.patch_end_pos.cuda() if batch.patch_end_pos is not None else None,
+                   patch_ids=batch.patch_ids.cuda() if batch.patch_ids is not None else None)
+
     if args.discriminating:
-        data = {}
-        data["first_hiddens"] = encoder_outputs[1]
-        data["target_tfs"] = batch.target_tfs
-        predict_tf_logits, discriminator_loss = model("discriminate", data)
+        output.discriminator_loss = output.discriminator_loss.mean()
+        predict_tfs = (output.discriminator_logits > args.discriminating_threshold).cpu()
+        epoch_state.dis_total += predict_tfs.size(0)
+        epoch_state.dis_correct += int((predict_tfs == batch.tf_labels).sum())
+        epoch_state.dis_loss += output.discriminator_loss.item()
 
-        predict_tfs = predict_tf_logits > args.discriminating_threshold
-        recoder.update_discriminator(step + 1,
-                                    discriminator_loss.mean().item(),
-                                    predict_tfs.cpu().tolist(),
-                                    batch.target_tfs.cpu().tolist())
     if args.detecting:
-        data = {}
-        data["masks"] = batch.attention_mask[:, 1:]
-        data["encoder_output"] = encoder_outputs[0][:, 1:, :]
-        data["target_labels"] = batch.target_labels[:, 1:]
-        labeling_output, detector_loss = model("detect", data)
-        predict_labels = torch.softmax(labeling_output, dim=-1).argmax(dim=-1)
-        list_predict_labels = [labels[mask].cpu().tolist() for labels, mask in zip(predict_labels, data["masks"])]
-        list_target_labels = [labels[mask].cpu().tolist() for labels, mask in zip(data["target_labels"], data["masks"])]
-        recoder.update_detector(list_predict_labels, list_target_labels, batch.examples)
+        predict_labels = output.detector_logits.argmax(dim=-1).cpu()
+        masks = batch.word_offsets[:, 1:] != -1
+        target_labels = batch.bio_tags[:, 1:]
+
+        for predict, target, mask in zip(predict_labels, target_labels, masks):
+            epoch_state.det_total += int(mask.sum())
+            epoch_state.det_correct += int((predict == target)[mask].sum())
 
         if args.discriminating:
-            detector_loss = detector_loss[batch.error_example_mask].mean()
+            error_example_mask = (1 - batch.tf_labels).bool().to(output.detector_loss.device)
+            if int(error_example_mask.sum()) != 0:
+                output.detector_loss = output.detector_loss[error_example_mask].mean()
+                epoch_state.det_loss += output.detector_loss.item()
+            else:
+                output.detector_loss = None
         else:
-            detector_loss = detector_loss.mean()
-        recoder.update_detector_loss(step + 1, detector_loss.item())
+            output.detector_loss = output.detector_loss.mean()
+            epoch_state.det_loss += output.detector_loss.item()
 
-    if args.correcting:
-        start_pos = batch.target_starts
-        end_pos = batch.target_ends
-        patch_ids = batch.target_ids
-        if patch_ids is not None:
-            patch_ids = patch_ids[:, :args.max_decode_step]
-            encoder_output = encoder_outputs[0]
-            patch_start_states = encoder_output[start_pos[0], start_pos[1]]
-            patch_end_states = encoder_output[end_pos[0], end_pos[1]]
-            patch_mid_states = []
-            for batch_idx, start_pos, end_pos in zip(start_pos[0], start_pos[1], end_pos[1]):
-                if start_pos + 1 == end_pos:
-                    if gpu_num > 1:
-                        patch_mid_states.append(model.module.corrector.emtpy_state)
-                    else:
-                        patch_mid_states.append(model.corrector.emtpy_state)
-                else:
-                    patch_mid_states.append(torch.mean(encoder_output[batch_idx, start_pos + 1:end_pos], dim=0))
-            patch_mid_states = torch.stack(patch_mid_states)
-            data = {}
-            data["patch_start_states"] = patch_start_states
-            data["patch_end_states"] = patch_end_states
-            data["patch_mid_states"] = patch_mid_states
-            data["patch_ids"] = patch_ids
-            data["length"] = patch_ids.size(-1)
-            _, corrector_loss = model("correct", data)
-            recoder.update_corrector(corrector_loss.mean().item())
-    losses = [discriminator_loss, detector_loss, corrector_loss]
-    return losses
+    if args.correcting and batch.patch_idx is not None:
+        # epoch_state.cor_total += int((batch.patch_ids != -100).sum())
+        predict_tokens = output.corrector_logits.argmax(dim=-1).cpu()
+        masks = batch.patch_ids != -100
+        target_tokens = batch.patch_ids
+        for predict, target, mask in zip(predict_tokens, target_tokens, masks):
+            epoch_state.cor_total += int(mask.sum())
+            epoch_state.cor_correct += int((predict == target)[mask].sum())
+        epoch_state.cor_loss += output.corrector_loss.item()
+
+    losses = [output.discriminator_loss, output.detector_loss, output.corrector_loss]
+
+    return epoch_state, losses
 
 
-def train(model: Patcher, train_data: Dataset, valid_data: Dataset, model_save_dir: str, gpu_num: int, recoder: Statistic,
-          args):
+def multi_task_loss(losses, args):
+    if args.loss_weight == "manual":
+        loss = 0
+        if losses[0] is not None:
+            loss += losses[0] * args.dis_weight
+        if losses[1] is not None:
+            loss += losses[1] * args.det_weight
+        if losses[2] is not None:
+            loss += losses[2] * args.cor_weight
+        return loss
+    elif args.loss_weight == "balance":
+        losses = [loss for loss in losses if loss is not None]
+        total_loss = sum([loss.item() for loss in losses])
+        weights = [len(losses) * loss.item() / total_loss for loss in losses]
+        loss = sum(weight * loss for weight, loss in zip(weights, losses))
+        return loss
+
+
+def train(model: Patcher, train_data: GECDataset, valid_data: GECDataset, model_save_dir: str, args):
     if args.freeze:
         for name, value in model.encoder.named_parameters():
             value.requires_grad = False
@@ -96,49 +111,43 @@ def train(model: Patcher, train_data: Dataset, valid_data: Dataset, model_save_d
         'weight_decay':
         0.0
     }]
-    total_train_steps = train_data.get_batch_num() * args.epoch
+    total_train_steps = len(train_data) // args.batch_size * args.epoch
     warmup_steps = int(args.warmup * total_train_steps)
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, betas=(0.9, 0.98), eps=1e-6, weight_decay=0.01)
     scheduler = get_constant_schedule_with_warmup(optimizer, warmup_steps)
 
-    current_step = 0
-    decay_ratio = None
     for i in range(args.epoch):
         model.train()
-        recoder.reset("train", i + 1)
-        train_gen = train_data.generator()
-        step_num = train_data.get_batch_num()
-        process_bar = tqdm(enumerate(train_gen), total=step_num, desc="Training in epoch %d/%d" % (i + 1, args.epoch))
+        train_state = EpochState()
+        train_gen = DataLoader(train_data, args.batch_size, shuffle=True, collate_fn=train_data.collect_fn)
+        process_bar = tqdm(enumerate(train_gen),
+                           total=len(train_data) // args.batch_size,
+                           desc="Training in epoch %d/%d" % (i + 1, args.epoch))
         for step, batch in process_bar:
-            losses = handle_a_batch(step, model, batch, recoder, args)
+            train_state, losses = handle_a_batch(model, batch, train_state)
             optimizer.zero_grad()
-            loss = sum(filter(lambda x: x is not None, losses))
-            if gpu_num > 1:
-                loss.mean().backward()
-            else:
-                loss.backward()
-            process_bar.set_postfix(recoder.get_current_log())
+            loss = multi_task_loss(losses, args)
+            loss.backward()
+            process_bar.set_postfix(train_state.get_current_log(step + 1))
             optimizer.step()
             scheduler.step()
-            current_step += 1
-        recoder.save()
+        logging.info(f"epoch-{i+1} train result")
+        logging.info(str(train_state.get_current_log(step)))
         if valid_data is not None:
+            model.eval()
+            valid_gen = DataLoader(valid_data, 32, shuffle=False, collate_fn=valid_data.collect_fn)
+            valid_state = EpochState()
+            process_bar = tqdm(enumerate(valid_gen),
+                               total=len(valid_data) // 32,
+                               desc="Validing in epoch %d/%d" % (i + 1, args.epoch))
             with torch.no_grad():
-                model.eval()
-                recoder.reset("valid", i + 1)
-                valid_gen = valid_data.generator()
-                step_num = valid_data.get_batch_num()
-                process_bar = tqdm(enumerate(valid_gen), total=step_num, desc="Validing in epoch %d/%d" % (i + 1, args.epoch))
                 for step, batch in process_bar:
-                    handle_a_batch(step, model, batch, recoder, args)
+                    valid_state, _ = handle_a_batch(model, batch, valid_state)
                     # discriminator_loss, detector_loss, predict_labels, decoder_loss = outputs
-                    process_bar.set_postfix(recoder.get_current_log())
-                recoder.save()
-        if gpu_num > 1:
-            model.module.save(model_save_dir, i + 1)
-        else:
-            model.save(model_save_dir, i + 1)
-        tokenizer.save(model_save_dir, i+1)
+                    process_bar.set_postfix(valid_state.get_current_log(step + 1))
+            logging.info(f"epoch-{i+1} valid result")
+            logging.info(str(valid_state.get_current_log(step)))
+        model.save(tokenizer, model_save_dir, i + 1)
 
 
 if __name__ == "__main__":
@@ -150,7 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--epoch", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--gpus", type=int, nargs='+', default=None)
+    parser.add_argument("--gpu", type=int, default=0)
 
     parser.add_argument("-lower_case", default=False, action="store_true")
     parser.add_argument("-only_wrong", default=False, action="store_true")
@@ -161,75 +170,50 @@ if __name__ == "__main__":
     parser.add_argument("-detecting", default=True, action="store_false")
     parser.add_argument("-use_crf", default=True, action="store_false")
     parser.add_argument("-use_lstm", default=False, action="store_true")
-    parser.add_argument("-dir_del", default=False, action="store_true")
 
     parser.add_argument("-correcting", default=True, action="store_false")
     parser.add_argument("-use_detect_out", default=False, action="store_true")
-    parser.add_argument("--max_decode_step", default=4, type=int)
+    parser.add_argument("--max_patch_len", default=4, type=int)
+    parser.add_argument("--max_piece", default=4, type=int)
 
     parser.add_argument("-freeze", default=False, action="store_true")
-    parser.add_argument("--truncate", type=int, default=512)
+    parser.add_argument("--truncate", type=int, default=50)
     parser.add_argument("--warmup", type=float, default=0.05)
     parser.add_argument("--decay", type=float, default=1e-2)
 
+    parser.add_argument("--loss_weight", type=str, choices=["manual", "balance"], default="manual")
+    parser.add_argument("--dis_weight", type=float, default=1)
+    parser.add_argument("--det_weight", type=float, default=1)
+    parser.add_argument("--cor_weight", type=float, default=1)
+
     args = parser.parse_args()
-    random.seed(123)
-    np.random.seed(123)
-    torch.manual_seed(123)
-    
+
+    set_seed(123)
+
     if not (args.correcting or args.detecting or args.discriminating):
         raise ValueError("Cannot set discriminating, detecting and correcting to False at same time.")
-    if args.gpus:
-        gpu_num = len(args.gpus)
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in args.gpus])
-    else:
-        gpu_num = 0
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    with open(os.path.join(args.output_dir, "cmd"), "w") as f:
-        f.write(str(args))
-    log_dir = os.path.join(args.output_dir, "log")
+
+    set_logger(os.path.join(args.output_dir, "train.log"))
+    logging.debug(str(args))
     model_save_dir = os.path.join(args.output_dir, "model")
-    tokenizer = Tokenizer(args.bert_dir, args.lower_case)
-    patch_handler = Patch_handler(tokenizer.PATCH_EMPTY_ID, args.dir_del)
-    recoder = Statistic(log_dir,
-                        args.discriminating,
-                        args.detecting,
-                        args.correcting,
-                        max_decode_step=args.max_decode_step,
-                        patch_handler=patch_handler)
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_dir, do_lower_case=args.lower_case, use_fast=True)
     model = Patcher(args.bert_dir,
                     discriminating=args.discriminating,
                     detecting=args.detecting,
                     correcting=args.correcting,
                     use_crf=args.use_crf,
-                    use_lstm=args.use_lstm)
-    if gpu_num == 1:
-        model = model.cuda()
-    if gpu_num > 1:
-        model = torch.nn.DataParallel(model).cuda()
-    train_data = Dataset(args.train_file,
-                         args.batch_size,
-                         inference=False,
-                         tokenizer=tokenizer,
-                         discriminating=args.discriminating,
-                         detecting=args.detecting,
-                         correcting=args.correcting,
-                         dir_del=args.dir_del,
-                         only_wrong=args.only_wrong,
-                         truncate=args.truncate)
+                    use_lstm=args.use_lstm,
+                    max_patch_len=args.max_patch_len)
+    model = model.cuda()
+    train_data = GECDataset(args.train_file, tokenizer, False, args.only_wrong, args.max_piece, args.truncate,
+                            args.max_patch_len)
     if args.valid_file:
-        valid_data = Dataset(args.valid_file,
-                             args.batch_size,
-                             inference=False,
-                             tokenizer=tokenizer,
-                             discriminating=args.discriminating,
-                             detecting=args.detecting,
-                             correcting=args.correcting,
-                             dir_del=args.dir_del,
-                             only_wrong=args.only_wrong,
-                             truncate=args.truncate)
+        valid_data = GECDataset(args.valid_file, tokenizer, False, args.only_wrong, args.max_piece, 512, args.max_patch_len)
     else:
         valid_data = None
 
-    train(model, train_data, valid_data, model_save_dir, gpu_num, recoder, args)
+    train(model, train_data, valid_data, model_save_dir, args)

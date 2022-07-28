@@ -1,4 +1,3 @@
-from grpc_client import main
 import numpy as np
 import pickle
 import argparse
@@ -22,8 +21,8 @@ def search(tsv,pkl, threshold=None):
     
     acc=0
     best=0
-    for i in range(1001):
-        thres = i*0.001
+    for i in range(101):
+        thres = i*0.01
         p = ps>thres
         r = int(sum(p==tfs))
         a = r/len(tfs)
@@ -39,5 +38,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     thres, acc = search(args.valid_file, args.valid_pkl)
     print(args.valid_file)
-    print("Threshold:", thres)
-    print("Accuarcy:", acc)
+    print("Threshold: %.2f"%thres)
+    print("Accuarcy: %.2f"%acc)

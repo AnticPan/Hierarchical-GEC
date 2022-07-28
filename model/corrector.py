@@ -96,39 +96,52 @@ class Corrector(nn.Module):
         self.enable_mid_state = enable_mid_state
         self.position_embeddings = nn.Embedding(max_decode_length, pos_embedding_dim)
         if enable_mid_state:
-            self.mlp_layer_norm = MLPWithLayerNorm(hidden_size, hidden_size * 3 + pos_embedding_dim)
+            self.mlp_layer_norm = MLPWithLayerNorm(word_embedding_weight.size(1), hidden_size * 3 + pos_embedding_dim)
         else:
-            self.mlp_layer_norm = MLPWithLayerNorm(hidden_size, hidden_size * 2 + pos_embedding_dim)
+            self.mlp_layer_norm = MLPWithLayerNorm(word_embedding_weight.size(1), hidden_size * 2 + pos_embedding_dim)
         self.project_layer = nn.Linear(word_embedding_weight.size(1),
                                         word_embedding_weight.size(0),
                                         bias=False)
         self.project_layer.weight = word_embedding_weight
         self.bias = nn.Parameter(torch.zeros(word_embedding_weight.size(0)))
         self.max_decode_length = max_decode_length
-        self.log_softmax = nn.LogSoftmax(dim=-1)
         self.emtpy_state = nn.Parameter(torch.rand((hidden_size,), dtype=torch.float))
-        self.criterion = nn.NLLLoss(ignore_index=-100)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
-    def forward(self, start_states:torch.Tensor, end_states: torch.Tensor, decode_length:int, 
-                mid_states:torch.Tensor=None, target_ids:torch.Tensor=None):
+    def forward(self, words_states:torch.Tensor, patch_idx: torch.Tensor, patch_start_pos: torch.Tensor,
+                patch_end_pos, patch_mid_pos=None, patch_ids:torch.Tensor=None):
+
+        
+        start_states = words_states[patch_idx, patch_start_pos]
+        end_states = words_states[patch_idx, patch_end_pos]
+        if patch_mid_pos is not None:
+            mid_states = words_states[patch_idx, patch_mid_pos]
+            empty_tag = torch.tensor(-1, device=mid_states.device)
+            empty_idx, empty_pos = torch.nonzero(patch_mid_pos==empty_tag, as_tuple=True)
+            if empty_idx.size(0) > 0:
+                mid_states[empty_idx, empty_pos] = self.emtpy_state
+            mask = (patch_mid_pos != -2).unsqueeze(-1)
+            mid_len = mask.sum(1)
+            mid_states = (mid_states*mask).sum(1)/mid_len
+
         patch_num = start_states.size()[0]
-        decode_length = min(self.max_decode_length, decode_length)
         # pair states: patch num, decode_length, dim
-        left_hidden = start_states.contiguous().unsqueeze(1).repeat(1, decode_length, 1)
-        right_hidden = end_states.contiguous().unsqueeze(1).repeat(1, decode_length, 1)
+        left_hidden = start_states.repeat(1, self.max_decode_length, 1)
+        right_hidden = end_states.repeat(1, self.max_decode_length, 1)
         
         # (decode_length, dim)
-        position_embeddings = self.position_embeddings.weight[:decode_length,]
+        position_embeddings = self.position_embeddings.weight
         if self.enable_mid_state:
-            mid_hidden = mid_states.contiguous().unsqueeze(1).repeat(1, decode_length, 1)
+            mid_hidden = mid_states.unsqueeze(1).repeat(1, self.max_decode_length, 1)
             states = torch.cat((left_hidden, mid_hidden, right_hidden, position_embeddings.unsqueeze(0).repeat(patch_num, 1, 1)), -1)
         else:
             states = torch.cat((left_hidden, right_hidden, position_embeddings.unsqueeze(0).repeat(patch_num, 1, 1)), -1)
         hidden_states = self.mlp_layer_norm(states)
         # target scores : patch_num, decode_length, vocab_size
-        target_scores = self.project_layer(hidden_states) + self.bias
+
+        target_logits = self.project_layer(hidden_states) + self.bias
 
         loss = None
-        if isinstance(target_ids, torch.Tensor):
-            loss = self.criterion(self.log_softmax(target_scores).view(-1, target_scores.size(-1)), target_ids.reshape(-1))
-        return target_scores, loss
+        if patch_ids is not None:
+            loss = self.criterion(target_logits.view(-1, target_logits.size(-1)), patch_ids.view(-1))
+        return target_logits, loss

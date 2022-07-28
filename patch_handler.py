@@ -1,6 +1,8 @@
-from .structure import Example, Token, lists2tensor, BIO, Patch
+from utils import Example, Token, lists2tensor, BIO, Patch
 from typing import List, Tuple
 import copy
+import torch
+
 class Patch_handler:
     def __init__(self, empty_patch_id:int, dir_del:bool):
         self.empty_patch_id = empty_patch_id
@@ -57,55 +59,38 @@ class Patch_handler:
 
         return filtered_patches, patch_ids
 
-    def align_patch(self, label_length: int, predict_patch_pos: List[Tuple[int]], example: Example):
-        wordpiece_map = [0] * (label_length + 1) # plus 1 for [CLS]
-        for token in example.tokens:
-            if token.start >= label_length or token.end > label_length:
-                break
-            wordpiece_map[token.start:token.end] = list(range(token.end - token.start))
-        aligned_patch_pos = []
-        pre_end = -1
-        for start, end in predict_patch_pos:
-            if wordpiece_map[start + 1] == 0:
-                aligned_start = start
-            else:
-                aligned_start = start - wordpiece_map[start] - 1
-                assert aligned_start >= 0
-            if wordpiece_map[end] != 0:
-                aligned_end = end + 1
-                while aligned_end < label_length and wordpiece_map[aligned_end] != 0:
-                    aligned_end += 1
-                if aligned_end == label_length:
-                    aligned_end -= 1
-            else:
-                aligned_end = end
-            if aligned_start < pre_end:
-                pre_start = aligned_patch_pos[-1][0]
-                aligned_patch_pos.pop()
-                aligned_patch_pos.append((pre_start, aligned_end))
-            else:
-                aligned_patch_pos.append((aligned_start, aligned_end))
-            pre_end = aligned_end
-        return aligned_patch_pos
 
-    def get_patch_pos(self, labels_list: List[List[int]], incor_ids: List[int]):
-        start_pos = [[],[]]
-        end_pos = [[],[]]
+    def get_patch_pos(self, labels_list: List[List[int]]):
+        patch_idx = []
+        patch_start_pos = []
+        patch_mid_pos = []
+        patch_end_pos = []
         del_patches = []
         for idx, labels in enumerate(labels_list):
             _, patch_sets = self.get_patch_sets(labels)
             for start, end in patch_sets:
-                if self.dir_del:
-                    if BIO["B-R"] in labels[start:end-1]:
-                        del_patches.append([incor_ids[idx], Patch(start, end, [Token("",[self.empty_patch_id],0,1)])])
-                start_pos[0].append(incor_ids[idx])
-                start_pos[1].append(start)
-                end_pos[0].append(incor_ids[idx])
-                end_pos[1].append(end)
-        if start_pos == [[],[]]:
-            start_pos = None
-            end_pos = None
-        return start_pos, end_pos, del_patches
+                if self.dir_del and BIO["B-R"] in labels[start:end-1]:
+                    del_patches.append([idx, Patch(start, end, "",[self.empty_patch_id])])
+                else:
+                    patch_idx.append(idx)
+                    patch_start_pos.append(start)
+                    patch_end_pos.append(end)
+                    if start+1 == end:
+                        patch_mid_pos.append([-1])
+                    else:
+                        patch_mid_pos.append(list(range(start+1, end)))
+        if len(patch_idx) == 0:
+            patch_idx = None
+            patch_start_pos = None
+            patch_mid_pos = None
+            patch_end_pos = None
+        else:
+            max_mid_pos_len = max(len(mid_pos) for mid_pos in patch_mid_pos)
+            patch_idx = torch.tensor(patch_idx, dtype=torch.long).unsqueeze(1)
+            patch_start_pos = torch.tensor(patch_start_pos, dtype=torch.long).unsqueeze(1)
+            patch_end_pos = torch.tensor(patch_end_pos, dtype=torch.long).unsqueeze(1)
+            patch_mid_pos = lists2tensor(patch_mid_pos, max_mid_pos_len, -2)
+        return patch_idx, patch_start_pos, patch_mid_pos, patch_end_pos, del_patches
 
     def get_patch_sets(self, labels: List[int]):
         incomplete, patch_pos = self._get_BIO_patch_sets(labels)
